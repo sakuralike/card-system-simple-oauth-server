@@ -1,0 +1,11 @@
+# 卡密提取系统 - Apache 访问保护
+# 说明：config.php 含数据库密码与 OAuth Client Secret，禁止通过 HTTP 直接访问。
+# nginx 环境请自行添加：
+#   location ~* /(config|config\.example)\.php$ { deny all; }
+
+<FilesMatch "^(config|config\.example)\.php$">
+    Require all denied
+</FilesMatch>
+
+# 禁止列出目录内容
+Options -Indexes

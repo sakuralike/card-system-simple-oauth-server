@@ -1,0 +1,14 @@
+/.playwright-mcp/
+/.workbuddy/
+/规划文档/
+
+**/config.php
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+*.sql
+*.sql.gz
+*.log
