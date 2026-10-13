@@ -156,6 +156,8 @@ class Auth {
             $userId = $existingUser['id'];
         } else {
             // 创建新用户
+            $userData['daily_limit'] = max(0, (int) DEFAULT_DAILY_LIMIT);
+            $userData['cards_per_draw'] = max(1, (int) DEFAULT_CARDS_PER_DRAW);
             $userId = $db->insert('users', $userData);
         }
 

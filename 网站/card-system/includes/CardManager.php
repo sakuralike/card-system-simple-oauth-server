@@ -56,12 +56,31 @@ class CardManager {
      * 删除分类
      */
     public function deleteCategory($id) {
-        // 将该分类下的卡密移到默认分类
-        $this->db->query(
-            "UPDATE " . DB_PREFIX . "cards SET category_id = 1 WHERE category_id = ?",
-            [$id]
-        );
-        return $this->db->delete('categories', 'id = ? AND id != 1', [$id]);
+        $pdo = $this->db->getPdo();
+        try {
+            $pdo->exec('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+            $pdo->beginTransaction();
+            $category = $this->db->fetch(
+                'SELECT id FROM ' . DB_PREFIX . 'categories WHERE id = ? FOR UPDATE',
+                [$id]
+            );
+            if (!$category || (int) $id === 1) {
+                $pdo->rollBack();
+                return false;
+            }
+            $this->db->query(
+                "UPDATE " . DB_PREFIX . "cards SET category_id = 1 WHERE category_id = ?",
+                [$id]
+            );
+            $result = $this->db->delete('categories', 'id = ? AND id != 1', [$id]);
+            $pdo->commit();
+            return $result;
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $e;
+        }
     }
     
     /**

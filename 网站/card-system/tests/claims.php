@@ -18,7 +18,7 @@ $pdo = new PDO($dsn, getenv('CARD_TEST_USER') ?: 'root', getenv('CARD_TEST_PASSW
 if ($pdo->query('SELECT DATABASE()')->fetchColumn() !== 'card_claim_test') {
     throw new RuntimeException('Refusing to use a non-test database');
 }
-$worker = ($argv[1] ?? '') === '--worker';
+$worker = in_array($argv[1] ?? '', ['--worker', '--maintenance-worker'], true);
 $prefix = $worker ? getenv('CARD_TEST_PREFIX') : 'claimtest_' . bin2hex(random_bytes(6)) . '_';
 if (!preg_match('/^claimtest_[a-f0-9]{12}_$/D', $prefix)) {
     throw new RuntimeException('Invalid test prefix');
@@ -31,17 +31,43 @@ define('DEFAULT_CARDS_PER_DRAW', 1);
 date_default_timezone_set('Asia/Shanghai');
 require dirname(__DIR__) . '/includes/Database.php';
 require dirname(__DIR__) . '/includes/CardManager.php';
+require dirname(__DIR__) . '/includes/Auth.php';
 $reflection = new ReflectionClass(Database::class);
 $db = $reflection->newInstanceWithoutConstructor();
 $reflection->getProperty('pdo')->setValue($db, $pdo);
 $reflection->getProperty('instance')->setValue(null, $db);
 
-if ($worker) {
+if (($argv[1] ?? '') === '--worker') {
     $manager = new CardManager();
     while (microtime(true) < (float) $argv[5]) {
         usleep(1000);
     }
     echo json_encode($manager->drawCard((int) $argv[2], (int) $argv[3], $argv[4]), JSON_THROW_ON_ERROR);
+    exit;
+}
+
+if (($argv[1] ?? '') === '--maintenance-worker') {
+    $manager = new CardManager();
+    echo "READY\n";
+    fflush(STDOUT);
+    try {
+        switch ($argv[2]) {
+            case 'delete':
+                $result = (bool) $manager->deleteCategory((int) $argv[3]);
+                break;
+            case 'add':
+                $result = $manager->addCard(['category_id' => (int) $argv[3], 'card_code' => $argv[4]]);
+                break;
+            case 'import':
+                $result = $manager->importCards((int) $argv[3], [$argv[4] . '-1', $argv[4] . '-2']);
+                break;
+            default:
+                throw new RuntimeException('Unknown maintenance operation');
+        }
+        echo json_encode(['success' => true, 'result' => $result], JSON_THROW_ON_ERROR);
+    } catch (InvalidArgumentException $e) {
+        echo json_encode(['success' => false, 'reason' => 'missing-category'], JSON_THROW_ON_ERROR);
+    }
     exit;
 }
 
@@ -97,8 +123,85 @@ function parallelDraws($requests) {
     return $results;
 }
 
+function parallelMaintenance($categoryId, $operation, $writerFirst) {
+    global $db, $pdo;
+    $readyLock = DB_PREFIX . 'maintenance_ready';
+    $resumeLock = DB_PREFIX . 'maintenance_resume';
+    if ((int) $db->query('SELECT GET_LOCK(?, 10)', [$resumeLock])->fetchColumn() !== 1) {
+        throw new RuntimeException('Unable to hold maintenance test lock');
+    }
+    $processes = [];
+    $outputs = [];
+    $waited = false;
+    try {
+        $timing = $writerFirst ? 'BEFORE INSERT' : 'AFTER UPDATE';
+        $condition = $writerFirst ? 'NEW.category_id = ' . $categoryId : 'OLD.category_id = ' . $categoryId . ' AND NEW.category_id = 1';
+        $pdo->exec('CREATE TRIGGER ' . DB_PREFIX . 'pause_maintenance ' . $timing . ' ON ' . DB_PREFIX . 'cards FOR EACH ROW BEGIN IF ' . $condition . " THEN
+            DO GET_LOCK('$readyLock', 15);
+            DO GET_LOCK('$resumeLock', 15);
+            DO RELEASE_LOCK('$resumeLock');
+            DO RELEASE_LOCK('$readyLock');
+            END IF; END");
+        $operations = $writerFirst ? [$operation, 'delete'] : ['delete', $operation];
+        foreach ($operations as $index => $action) {
+            $command = [PHP_BINARY, '-d', 'extension_dir=' . ini_get('extension_dir'), '-d', 'extension=pdo_mysql',
+                __FILE__, '--maintenance-worker', $action, (string) $categoryId, 'maintenance-' . $categoryId];
+            $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+            if (!is_resource($process)) {
+                throw new RuntimeException('Unable to start maintenance worker');
+            }
+            fclose($pipes[0]);
+            $processes[$action] = [$process, $pipes, ''];
+            if (fgets($pipes[1]) !== "READY\n") {
+                throw new RuntimeException('Maintenance worker did not become ready');
+            }
+            if ($index === 0) {
+                $deadline = microtime(true) + 10;
+                while ($db->query('SELECT IS_USED_LOCK(?)', [$readyLock])->fetchColumn() === null) {
+                    if (microtime(true) >= $deadline) {
+                        throw new RuntimeException('Maintenance worker did not reach its transaction barrier');
+                    }
+                    usleep(10000);
+                }
+            } else {
+                usleep(250000);
+                stream_set_blocking($pipes[1], false);
+                $processes[$action][2] = stream_get_contents($pipes[1]);
+                stream_set_blocking($pipes[1], true);
+                $waited = $processes[$action][2] === '';
+            }
+        }
+    } finally {
+        $db->query('SELECT RELEASE_LOCK(?)', [$resumeLock]);
+        foreach ($processes as $action => [$process, $pipes, $earlyOutput]) {
+            $output = $earlyOutput . stream_get_contents($pipes[1]);
+            $error = stream_get_contents($pipes[2]);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            $outputs[$action] = [$output, $error, proc_close($process)];
+        }
+        $pdo->exec('DROP TRIGGER IF EXISTS ' . DB_PREFIX . 'pause_maintenance');
+    }
+    $results = ['waited' => $waited];
+    foreach ($outputs as $action => [$output, $error, $exitCode]) {
+        if ($exitCode !== 0) {
+            throw new RuntimeException('Maintenance worker failed: ' . $error);
+        }
+        $results[$action] = json_decode($output, true, 512, JSON_THROW_ON_ERROR);
+    }
+    return $results;
+}
+
 try {
     Database::createTables();
+    $pdo->exec('ALTER TABLE ' . DB_PREFIX . 'users ALTER COLUMN daily_limit SET DEFAULT 9, ALTER COLUMN cards_per_draw SET DEFAULT 4');
+    $createUser = new ReflectionMethod(Auth::class, 'createOrUpdateUser');
+    $oauthUser = $createUser->invoke(null, ['ID' => 500001, 'user_login' => 'oauth-new', 'user_email' => 'first@example.test']);
+    check((int) $oauthUser['daily_limit'] === DEFAULT_DAILY_LIMIT && (int) $oauthUser['cards_per_draw'] === DEFAULT_CARDS_PER_DRAW, 'new OAuth users use current settings instead of old SQL defaults');
+    $db->update('users', ['daily_limit' => 0, 'cards_per_draw' => 5, 'role' => 'admin', 'is_banned' => 1], 'id = ?', [$oauthUser['id']]);
+    $updatedUser = $createUser->invoke(null, ['ID' => 500001, 'user_login' => 'oauth-updated', 'user_email' => 'updated@example.test']);
+    check($updatedUser['id'] === $oauthUser['id'] && $updatedUser['username'] === 'oauth-updated' && $updatedUser['email'] === 'updated@example.test', 'returning OAuth users refresh their profile without creating another user');
+    check((int) $updatedUser['daily_limit'] === 0 && (int) $updatedUser['cards_per_draw'] === 5 && $updatedUser['role'] === 'admin' && (int) $updatedUser['is_banned'] === 1, 'returning OAuth users preserve explicit zero quota, batch size and admin restrictions');
     $manager = new CardManager();
     $legacyUser = user();
     $legacyCard = $manager->addCard(['category_id' => 1, 'card_code' => 'legacy-code', 'content' => 'legacy-content']);
@@ -233,6 +336,55 @@ try {
     check($db->count('cards', 'category_id = ?', [$oldDuplicates]) === 3, 'legacy duplicate inventory is preserved');
     check($manager->getAvailableCardCount($oldDuplicates) === 0, 'available inventory excludes issued duplicates');
     check($manager->getAvailableCardCount($cat) === 0, 'disabled category has no claimable inventory');
+
+    $moveCategory = category(2);
+    $movedCards = $db->fetchAll('SELECT * FROM ' . DB_PREFIX . 'cards WHERE category_id = ? ORDER BY id', [$moveCategory]);
+    check((bool) $manager->deleteCategory($moveCategory) && !$manager->getCategory($moveCategory), 'deleting a category removes the category');
+    foreach ($movedCards as $card) {
+        $card['category_id'] = 1;
+        check($manager->getCard($card['id']) === $card, 'deleting a category moves each intact card to the default category');
+    }
+    $defaultStock = $db->count('cards', 'category_id = 1');
+    check($manager->deleteCategory(1) === false && (bool) $manager->getCategory(1) && $db->count('cards', 'category_id = 1') === $defaultStock, 'default category and its inventory cannot be deleted');
+    $inventoryCount = $db->count('cards');
+    $categoryCount = $db->count('categories');
+    check($manager->deleteCategory(999999) === false && $db->count('cards') === $inventoryCount && $db->count('categories') === $categoryCount, 'deleting a missing category changes nothing');
+    check(!$pdo->inTransaction(), 'rejected category deletion leaves no transaction open');
+
+    $failedDeleteCategory = category(2);
+    $unchangedCards = $db->fetchAll('SELECT * FROM ' . DB_PREFIX . 'cards WHERE category_id = ? ORDER BY id', [$failedDeleteCategory]);
+    $pdo->exec('CREATE TRIGGER ' . DB_PREFIX . 'fail_category_delete BEFORE DELETE ON ' . DB_PREFIX . "categories FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'test category rollback'");
+    $deleteFailed = false;
+    try {
+        $manager->deleteCategory($failedDeleteCategory);
+    } catch (PDOException $e) {
+        $deleteFailed = $e->getCode() === '45000';
+    } finally {
+        $pdo->exec('DROP TRIGGER ' . DB_PREFIX . 'fail_category_delete');
+    }
+    check($deleteFailed && (bool) $manager->getCategory($failedDeleteCategory), 'failed category DELETE preserves the category');
+    check($unchangedCards === $db->fetchAll('SELECT * FROM ' . DB_PREFIX . 'cards WHERE category_id = ? ORDER BY id', [$failedDeleteCategory]), 'failed category DELETE rolls back every inventory move');
+    check(!$pdo->inTransaction(), 'failed category DELETE rolls back the transaction');
+
+    foreach (['add', 'import'] as $operation) {
+        foreach ([true, false] as $writerFirst) {
+            $maintenanceCategory = category(1);
+            $results = parallelMaintenance($maintenanceCategory, $operation, $writerFirst);
+            $label = $operation . ($writerFirst ? ' before delete' : ' after delete');
+            check($results['waited'], $label . ' waits for the competing category transaction');
+            check($results['delete']['success'] && $results['delete']['result'] && !$manager->getCategory($maintenanceCategory), $label . ' completes category deletion');
+            if ($writerFirst) {
+                $newCards = $operation === 'add' ? 1 : 2;
+                check($results[$operation]['success'] && (int) $results[$operation]['result'] > 0, $label . ' commits new inventory before deletion');
+                check($db->count('cards', 'category_id = 1 AND card_code LIKE ?', ['maintenance-' . $maintenanceCategory . '%']) === $newCards, $label . ' moves concurrently added inventory to the default category');
+            } else {
+                check(!$results[$operation]['success'] && $results[$operation]['reason'] === 'missing-category', $label . ' rejects a category removed while waiting');
+                check($db->count('cards', 'card_code LIKE ?', ['maintenance-' . $maintenanceCategory . '%']) === 0, $label . ' does not insert inventory into the removed category');
+            }
+            check($db->count('cards', 'category_id = ?', [$maintenanceCategory]) === 0, $label . ' leaves no inventory in the removed category');
+            check((int) $db->query('SELECT COUNT(*) FROM ' . DB_PREFIX . 'cards c LEFT JOIN ' . DB_PREFIX . 'categories cat ON cat.id = c.category_id WHERE cat.id IS NULL')->fetchColumn() === 0, $label . ' leaves no orphaned cards');
+        }
+    }
     echo "PASS $checks checks\n";
 } finally {
     foreach (['draw_logs', 'draw_requests', 'cards', 'categories', 'users', 'settings'] as $table) {

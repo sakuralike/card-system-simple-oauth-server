@@ -99,6 +99,7 @@ final class Plugin {
             access_token VARCHAR(200) NOT NULL,
             refresh_token VARCHAR(200),
             code VARCHAR(200),
+            code_redirect_uri TEXT,
             code_expires DATETIME,
             token_expires DATETIME,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -134,8 +135,8 @@ final class Plugin {
 
 		$wpdb->query(
 			"DELETE FROM {$tokens_table}
-             WHERE (code_expires IS NOT NULL AND code_expires < NOW())
-                OR (token_expires IS NOT NULL AND token_expires < NOW())"
+             WHERE (code_expires IS NOT NULL AND code_expires < UTC_TIMESTAMP())
+                OR (token_expires IS NOT NULL AND token_expires < UTC_TIMESTAMP())"
 		);
 	}
 
@@ -224,12 +225,12 @@ final class Plugin {
 
 			// 生成授权码
 			$code = wp_generate_password( 40, false );
-			if ( 1 !== $this->save_auth_code( $client_id, $user->ID, $code ) ) {
+			$target = ( '' !== $redirect_uri ) ? $redirect_uri : $this->primary_redirect( $client );
+			if ( 1 !== $this->save_auth_code( $client_id, $user->ID, $code, $target ) ) {
 				wp_die( '暂时无法生成授权码，请重试', '授权失败', array( 'response' => 500 ) );
 			}
 
 			// ★ 重定向回客户端：始终使用注册时登记的回调地址
-			$target = ( '' !== $redirect_uri ) ? $redirect_uri : $this->primary_redirect( $client );
 			$redirect = add_query_arg(
 				array(
 					'code'  => $code,
@@ -343,14 +344,13 @@ final class Plugin {
 			$this->json_error( 'unsupported_grant_type', 'Only authorization_code is supported', 400 );
 		}
 
-		// redirect_uri 若提供，必须与注册值一致
-		if ( '' !== $redirect_uri && ! $this->is_allowed_redirect( $client, $redirect_uri ) ) {
+		if ( '' === $redirect_uri || ! $this->is_allowed_redirect( $client, $redirect_uri ) ) {
 			$this->json_error( 'invalid_grant', 'redirect_uri does not match the registered value', 400 );
 		}
 
 		// 验证授权码
 		$auth = $this->verify_auth_code( $client_id, $code );
-		if ( ! $auth || 1 !== $this->delete_auth_code( $auth ) ) {
+		if ( ! $auth || empty( $auth['code_redirect_uri'] ) || ! hash_equals( (string) $auth['code_redirect_uri'], $redirect_uri ) || 1 !== $this->delete_auth_code( $auth ) ) {
 			$this->json_error( 'invalid_grant', 'Authorization code is invalid, expired, or already used', 400 );
 		}
 
@@ -458,12 +458,36 @@ final class Plugin {
 		return false;
 	}
 
+	private function ensure_code_redirect_column() {
+		global $wpdb;
+
+		$check = "SHOW COLUMNS FROM {$this->tokens_table} LIKE 'code_redirect_uri'";
+		if ( 'code_redirect_uri' === $wpdb->get_var( $check ) ) {
+			return true;
+		}
+		$lock = 'oauth_redirect_' . substr( hash( 'sha256', $wpdb->dbname . ':' . $this->tokens_table ), 0, 40 );
+		if ( 1 !== (int) $wpdb->get_var( $wpdb->prepare( 'SELECT GET_LOCK(%s, 15)', $lock ) ) ) {
+			return false;
+		}
+		try {
+			if ( 'code_redirect_uri' === $wpdb->get_var( $check ) ) {
+				return true;
+			}
+			return false !== $wpdb->query( "ALTER TABLE {$this->tokens_table} ADD COLUMN code_redirect_uri TEXT NULL" );
+		} finally {
+			$wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $lock ) );
+		}
+	}
+
 	/**
 	 * 保存授权码
 	 */
-	private function save_auth_code( $client_id, $user_id, $code ) {
+	private function save_auth_code( $client_id, $user_id, $code, $redirect_uri ) {
 		global $wpdb;
 
+		if ( ! $this->ensure_code_redirect_column() ) {
+			return false;
+		}
 		return $wpdb->insert(
 			$this->tokens_table,
 			array(
@@ -471,6 +495,7 @@ final class Plugin {
 				'user_id'      => $user_id,
 				'access_token' => '',
 				'code'         => $code,
+				'code_redirect_uri' => $redirect_uri,
 				'code_expires' => gmdate( 'Y-m-d H:i:s', time() + self::CODE_TTL ),
 			)
 		);
@@ -509,10 +534,11 @@ final class Plugin {
 		global $wpdb;
 		return $wpdb->query(
 			$wpdb->prepare(
-				"DELETE FROM {$this->tokens_table} WHERE id = %d AND client_id = %s AND code = %s AND code_expires > %s",
+				"DELETE FROM {$this->tokens_table} WHERE id = %d AND client_id = %s AND code = %s AND BINARY code_redirect_uri = BINARY %s AND code_expires > %s",
 				$auth['id'],
 				$auth['client_id'],
 				$auth['code'],
+				$auth['code_redirect_uri'],
 				gmdate( 'Y-m-d H:i:s' )
 			)
 		);
